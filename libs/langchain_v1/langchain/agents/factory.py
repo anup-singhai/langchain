@@ -1649,6 +1649,7 @@ def create_agent(
     # https://github.com/langchain-ai/langgraph/issues/7313
     config: RunnableConfig = {"recursion_limit": 9_999}
     config["metadata"] = {"ls_integration": "langchain_create_agent"}
+    config["configurable"] = {"ls_agent_type": "root"}
     if name:
         config["metadata"]["lc_agent_name"] = name
 

@@ -17,9 +17,12 @@ configurations.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any
+from unittest.mock import MagicMock
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_core.tracers.langchain import LangChainTracer
 from langgraph.prebuilt import InjectedStore
 from langgraph.store.memory import InMemoryStore
 
@@ -258,6 +261,7 @@ def test_tool_runtime_config_access() -> None:
             config_data["config_keys"] = list(runtime.config.keys())
             config_data["recursion_limit"] = runtime.config.get("recursion_limit")
             config_data["metadata"] = runtime.config.get("metadata")
+            config_data["configurable"] = runtime.config.get("configurable")
         return f"Config accessed for {x}"
 
     agent = create_agent(
@@ -279,6 +283,7 @@ def test_tool_runtime_config_access() -> None:
     assert "config_keys" in config_data
     assert config_data["recursion_limit"] == 9999
     assert config_data["metadata"]["ls_integration"] == "langchain_create_agent"
+    assert config_data["configurable"]["ls_agent_type"] == "root"
 
     tool_message = result["messages"][2]
     assert isinstance(tool_message, ToolMessage)
@@ -842,3 +847,59 @@ async def test_combined_injected_state_runtime_store_async() -> None:
     # Verify store was injected and writable
     assert injected_data["store"] is not None
     assert injected_data["store_write_success"] is True
+
+
+def test_ls_agent_type_is_trace_only_metadata() -> None:
+    """Test that ls_agent_type is trace-only metadata, not streamed to callbacks."""
+    # Capture metadata from regular callback handler (simulates streamed metadata)
+    captured_callback_metadata: list[dict[str, Any]] = []
+
+    class CaptureHandler(BaseCallbackHandler):
+        def on_chain_start(
+            self,
+            serialized: dict[str, Any],
+            inputs: dict[str, Any],
+            *,
+            run_id: str,
+            parent_run_id: str | None = None,
+            tags: list[str] | None = None,
+            metadata: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            captured_callback_metadata.append({"tags": tags, "metadata": metadata})
+
+    # Mock the LangSmith client to capture what gets sent to the tracer
+    mock_client = MagicMock()
+    create_run_mock = MagicMock(return_value=None)
+    mock_client.create_run = create_run_mock
+
+    tracer = LangChainTracer(client=mock_client)
+    capture = CaptureHandler()
+
+    agent = create_agent(
+        model=FakeToolCallingModel(tool_calls=[[], []]),
+        tools=[],
+        system_prompt="You are a helpful assistant.",
+    )
+
+    # Invoke with both tracer and capture handler
+    agent.invoke(
+        {"messages": [HumanMessage("hi?")]},
+        config={"callbacks": [tracer, capture]},
+    )
+
+    # Verify that ls_agent_type is NOT in the regular callback metadata
+    # (it should only go to the tracer)
+    assert len(captured_callback_metadata) > 0
+    for captured in captured_callback_metadata:
+        metadata = captured.get("metadata") or {}
+        assert metadata.get("ls_agent_type") is None, (
+            f"ls_agent_type should not be in callback metadata, but got: {metadata}"
+        )
+
+    # Verify that ls_agent_type IS in the tracer metadata (sent to LangSmith)
+    assert create_run_mock.called
+    posted_run = create_run_mock.call_args[1] if create_run_mock.call_args else None
+    if posted_run:
+        metadata = posted_run.get("extra", {}).get("metadata", {})
+        assert metadata.get("ls_agent_type") == "root"
